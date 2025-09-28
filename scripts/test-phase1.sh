@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Phase 1 completion test for Enterprise_Infrastructure_stack
+# - Ensures VirtualBox host-only subnet 192.168.100.0/24 is allowed
+# - Checks repo layout
+# - Verifies Vagrant VMs are running & reachable
+# - Confirms expected IPs
+# - Runs ping matrix from master-1
+# - Validates Terraform (syntactic + init/validate)
+#
+# Usage: scripts/test-phase1.sh [--up]   # --up will run `vagrant up` if needed
+
+set -u
+PROJECT_ROOT="$(pwd)"
+NEED_UP="${1:-}"
+
+# ---------- config ----------
+NODES=(master-1 master-2 master-3 worker-1 worker-2 worker-3 infra)
+declare -A IP
+IP[master-1]="192.168.100.11"
+IP[master-2]="192.168.100.12"
+IP[master-3]="192.168.100.13"
+IP[worker-1]="192.168.100.21"
+IP[worker-2]="192.168.100.22"
+IP[worker-3]="192.168.100.23"
+IP[infra]="192.168.100.50"
+
+VBOX_NETS_CONF="/etc/vbox/networks.conf"
+ALLOW_LINE_IPV4="* 192.168.100.0/24"
+ALLOW_LINE_IPV6="* fe80::/10"  # optional but harmless
+
+# ---------- helpers ----------
+ok()   { printf "\033[32m[ OK ]\033[0m %s\n" "$*"; }
+warn() { printf "\033[33m[WARN]\033[0m %s\n" "$*"; }
+err()  { printf "\033[31m[FAIL]\033[0m %s\n" "$*"; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; return 1; }
+}
+
+ssh_vagrant() {
+  local node="$1" cmd="$2"
+  timeout 25s vagrant ssh "$node" -c "$cmd" >/dev/null 2>&1
+}
+
+FAILS=0
+fail() { err "$*"; FAILS=$((FAILS+1)); }
+
+section() { printf "\n\033[1m== %s ==\033[0m\n" "$*"; }
+
+ensure_vbox_allowed_range() {
+  section "Ensuring VirtualBox allows 192.168.100.0/24"
+  if ! need_cmd VBoxManage; then
+    warn "VBoxManage not found; VirtualBox may not be installed or in PATH. Continuing anyway."
+  fi
+
+  # Create dir if missing
+  if [[ ! -d /etc/vbox ]]; then
+    sudo mkdir -p /etc/vbox || { fail "Cannot create /etc/vbox"; return; }
+  fi
+
+  # Create file if missing
+  if [[ ! -f "$VBOX_NETS_CONF" ]]; then
+    echo "# VirtualBox Host-Only allowed networks" | sudo tee "$VBOX_NETS_CONF" >/dev/null || {
+      fail "Cannot write $VBOX_NETS_CONF"; return;
+    }
+  fi
+
+  # Add IPv4 allow line if absent
+  if ! grep -qF "$ALLOW_LINE_IPV4" "$VBOX_NETS_CONF"; then
+    echo "$ALLOW_LINE_IPV4" | sudo tee -a "$VBOX_NETS_CONF" >/dev/null || {
+      fail "Failed adding $ALLOW_LINE_IPV4 to $VBOX_NETS_CONF"; return;
+    }
+    ok "Added: $ALLOW_LINE_IPV4"
+  else
+    ok "Already allowed: $ALLOW_LINE_IPV4"
+  fi
+
+  # Add IPv6 allow line if absent (optional)
+  if ! grep -qF "$ALLOW_LINE_IPV6" "$VBOX_NETS_CONF"; then
+    echo "$ALLOW_LINE_IPV6" | sudo tee -a "$VBOX_NETS_CONF" >/dev/null || true
+  fi
+
+  echo "--- $VBOX_NETS_CONF ---"
+  sudo cat "$VBOX_NETS_CONF" || true
+}
+
+# ---------- 0) Pre-flight ----------
+section "Pre-flight checks"
+for c in vagrant awk grep; do
+  if ! need_cmd "$c"; then fail "Install $c first"; fi
+done
+if command -v tree >/dev/null 2>&1; then
+  echo "(tree present)"
+else
+  warn "tree not installed — layout will be printed without tree"
+fi
+
+# Ensure VirtualBox host-only range is allowed
+ensure_vbox_allowed_range
+
+# ---------- 1) Repo layout ----------
+section "Repository layout"
+EXPECTED=(terraform kubernetes ansible docs scripts monitoring Vagrantfile)
+for p in "${EXPECTED[@]}"; do
+  if [[ -e "$PROJECT_ROOT/$p" ]]; then ok "found $p"; else fail "missing $p"; fi
+done
+
+if command -v tree >/dev/null 2>&1; then
+  tree -a -L 2 || true
+else
+  ls -la
+fi
+
+# ---------- 2) Vagrant status (optionally bring up) ----------
+section "Vagrant status"
+if ! vagrant status >/dev/null 2>&1; then
+  fail "vagrant status failed — is there a Vagrantfile here?"
+else
+  vagrant status
+  # If --up specified, try to start any non-running machines
+  if [[ "$NEED_UP" == "--up" ]]; then
+    warn "Attempting to bring up VMs (vagrant up)"
+    if ! vagrant up; then
+      fail "vagrant up failed"
+    fi
+  fi
+fi
+
+# Check each node is running
+for n in "${NODES[@]}"; do
+  if vagrant status "$n" 2>/dev/null | grep -q "running (virtualbox)"; then
+    ok "$n is running"
+  else
+    fail "$n is NOT running"
+  fi
+done
+
+# ---------- 3) IP check on each node ----------
+section "IP address verification"
+for n in "${NODES[@]}"; do
+  EXPECTED_IP="${IP[$n]}"
+  if ssh_vagrant "$n" "hostname -I | tr ' ' '\n' | grep -Fx ${EXPECTED_IP}"; then
+    ok "$n has expected IP ${EXPECTED_IP}"
+  else
+    fail "$n does not have expected IP ${EXPECTED_IP}"
+    # show what the node has
+    vagrant ssh "$n" -c "echo -n 'IPs: '; hostname -I" || true
+  fi
+done
+
+# ---------- 4) SSH command sanity ----------
+section "SSH command sanity"
+for n in "${NODES[@]}"; do
+  if ssh_vagrant "$n" "echo hello-from-\$(hostname)"; then
+    ok "ssh to $n works"
+  else
+    fail "ssh to $n failed"
+  fi
+done
+
+# ---------- 5) Ping matrix (from master-1) ----------
+section "Ping matrix from master-1"
+PING_LIST=("${IP[master-2]}" "${IP[master-3]}" "${IP[worker-1]}" "${IP[worker-2]}" "${IP[worker-3]}" "${IP[infra]}")
+PING_CMDS=""
+for ip in "${PING_LIST[@]}"; do
+  PING_CMDS+="echo -n '${ip} '; ping -c1 -W1 ${ip} >/dev/null 2>&1 && echo OK || echo FAIL; "
+done
+if vagrant ssh master-1 -c "$PING_CMDS"; then
+  OUT=$(vagrant ssh master-1 -c "$PING_CMDS")
+  echo "$OUT"
+  if echo "$OUT" | grep -q "FAIL"; then
+    fail "One or more pings failed from master-1"
+  else
+    ok "All pings OK from master-1"
+  fi
+else
+  fail "Could not run ping matrix from master-1"
+fi
+
+# ---------- 6) Terraform validation ----------
+section "Terraform validation"
+if [[ -d "$PROJECT_ROOT/terraform" ]] && compgen -G "$PROJECT_ROOT/terraform/*.tf" >/dev/null; then
+  pushd terraform >/dev/null || true
+  echo "Formatting check…"
+  terraform fmt -check -recursive || fail "terraform fmt check failed"
+  echo "Init (no backend)…"
+  terraform init -backend=false -input=false -upgrade || warn "terraform init failed (provider mismatch is OK for now)"
+  echo "Validate…"
+  if terraform validate; then
+    ok "terraform validate passed"
+  else
+    fail "terraform validate failed"
+  fi
+  popd >/dev/null || true
+else
+  warn "No terraform/*.tf files found — skipping Terraform checks"
+fi
+
+# ---------- 7) Summary ----------
+section "Summary"
+if [[ $FAILS -eq 0 ]]; then
+  ok "Phase 1 verification PASSED ✅"
+  exit 0
+else
+  err "Phase 1 verification FAILED with $FAILS issue(s) ❌"
+  echo "Hints:"
+  echo " - Ensure all VMs are running: vagrant up"
+  echo " - Verify VirtualBox host-only network for 192.168.100.0/24 (this script now writes /etc/vbox/networks.conf)"
+  echo " - Disable UFW inside nodes if pings fail: sudo ufw disable"
+  echo " - Adjust IPs in Vagrantfile or update IP[] map in this script"
+  echo " - Terraform may fail if using libvirt provider without KVM; switch to vsphere or keep Terraform for cloud only"
+  exit 1
+fi
+
